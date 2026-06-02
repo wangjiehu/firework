@@ -1,0 +1,12 @@
+# Local preview captures
+*.png
+
+# Earlier local experiments
+*.py
+__pycache__/
+.antigravitycli/
+tools/
+
+# Editor and OS noise
+.DS_Store
+Thumbs.db
