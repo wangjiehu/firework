@@ -1,0 +1,1813 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Realistic Fireworks</title>
+  <style>
+    html,
+    body {
+      margin: 0;
+      width: 100%;
+      height: 100%;
+      overflow: hidden;
+      background: #02040a;
+    }
+
+    canvas {
+      display: block;
+      width: 100vw;
+      height: 100vh;
+      background: #02040a;
+      cursor: crosshair;
+    }
+  </style>
+</head>
+<body>
+<canvas id="scene"></canvas>
+<script>
+(() => {
+  'use strict';
+
+  const canvas = document.getElementById('scene');
+  const ctx = canvas.getContext('2d', { alpha: false });
+  const exposure = document.createElement('canvas');
+  const exposureCtx = exposure.getContext('2d');
+  const smokeCanvas = document.createElement('canvas');
+  const smokeCtx = smokeCanvas.getContext('2d');
+  const bloomCanvas = document.createElement('canvas');
+  const bloomCtx = bloomCanvas.getContext('2d');
+  const grainCanvas = document.createElement('canvas');
+  const grainCtx = grainCanvas.getContext('2d');
+
+  let DPR = 1;
+  let W = 1;
+  let H = 1;
+  let SCALE = 1;
+  let HORIZON = 1;
+  let WATER = 1;
+  let wind = 0.004;
+  let windTarget = 0.004;
+  let nextLaunch = 0;
+  let elapsed = 0;
+  let farShore = [];
+  let skyline = [];
+  let shoreLights = [];
+  let boats = [];
+  let faintStars = [];
+  let narrowView = false;
+  let avgFrameMs = 16.7;
+  let quality = 1.0;
+  let audioCtx = null;
+  let audioEnabled = false;
+
+  const shells = [];
+  const particles = [];
+  const smokes = [];
+  const flashes = [];
+  const reflections = [];
+  const mines = [];
+  const crackleSeeds = [];
+  const crossetteSeeds = [];
+  const launchFlares = [];
+  const scheduledLaunches = [];
+
+  let hasResizedOnce = false;
+
+  const palette = [
+    [255, 78, 55],
+    [255, 116, 168],
+    [96, 179, 255],
+    [106, 242, 145],
+    [255, 207, 74],
+    [255, 157, 67],
+    [190, 142, 255],
+    [235, 246, 255],
+  ];
+  const gold = [255, 210, 92];
+  const amber = [255, 152, 43];
+  const whiteHot = [255, 252, 224];
+
+  function ensureAudio() {
+    if (audioEnabled) return;
+    const AudioCtor = window.AudioContext || window.webkitAudioContext;
+    if (!AudioCtor) return;
+    audioCtx = audioCtx || new AudioCtor();
+    audioCtx.resume();
+    audioEnabled = true;
+  }
+
+  function makeNoiseBuffer(duration) {
+    if (!audioCtx) return null;
+    const length = Math.max(1, Math.floor(audioCtx.sampleRate * duration));
+    const buffer = audioCtx.createBuffer(1, length, audioCtx.sampleRate);
+    const data = buffer.getChannelData(0);
+    for (let i = 0; i < length; i++) {
+      const envelope = 1 - i / length;
+      data[i] = (Math.random() * 2 - 1) * envelope;
+    }
+    return buffer;
+  }
+
+  function stereoPanFromX(x) {
+    return clamp((x / Math.max(1, W)) * 2 - 1, -0.85, 0.85);
+  }
+
+  function playFilteredNoise({ x = W / 2, duration = 0.5, gain = 0.06, frequency = 900, type = 'lowpass', when = 0 }) {
+    if (!audioEnabled || !audioCtx) return;
+    const start = audioCtx.currentTime + when;
+    const source = audioCtx.createBufferSource();
+    const filter = audioCtx.createBiquadFilter();
+    const amp = audioCtx.createGain();
+    const pan = audioCtx.createStereoPanner ? audioCtx.createStereoPanner() : null;
+
+    source.buffer = makeNoiseBuffer(duration);
+    if (!source.buffer) return;
+    filter.type = type;
+    filter.frequency.setValueAtTime(frequency, start);
+    filter.Q.setValueAtTime(0.8, start);
+    amp.gain.setValueAtTime(gain, start);
+    amp.gain.exponentialRampToValueAtTime(0.0001, start + duration);
+    if (pan) pan.pan.setValueAtTime(stereoPanFromX(x), start);
+
+    source.connect(filter);
+    if (pan) {
+      filter.connect(pan);
+      pan.connect(amp);
+    } else {
+      filter.connect(amp);
+    }
+    amp.connect(audioCtx.destination);
+    source.start(start);
+    source.stop(start + duration + 0.05);
+  }
+
+  function playLaunchSound(x) {
+    if (!audioEnabled || !audioCtx) return;
+    playFilteredNoise({ x, duration: 0.18, gain: 0.020, frequency: 1300, type: 'bandpass' });
+  }
+
+  function playBurstSound(x, size = 1, kind = 'peony') {
+    if (!audioEnabled || !audioCtx) return;
+    const start = audioCtx.currentTime;
+    const low = audioCtx.createOscillator();
+    const amp = audioCtx.createGain();
+    const pan = audioCtx.createStereoPanner ? audioCtx.createStereoPanner() : null;
+    low.type = 'sine';
+    low.frequency.setValueAtTime(kind === 'crackle' ? 82 : 54, start);
+    low.frequency.exponentialRampToValueAtTime(35, start + 0.55);
+    amp.gain.setValueAtTime(0.030 * size, start);
+    amp.gain.exponentialRampToValueAtTime(0.0001, start + 0.72);
+    if (pan) pan.pan.setValueAtTime(stereoPanFromX(x), start);
+    if (pan) {
+      low.connect(pan);
+      pan.connect(amp);
+    } else {
+      low.connect(amp);
+    }
+    amp.connect(audioCtx.destination);
+    low.start(start);
+    low.stop(start + 0.76);
+
+    playFilteredNoise({ x, duration: 0.72, gain: 0.042 * size, frequency: kind === 'strobe' ? 1800 : 760, type: 'lowpass', when: 0.018 });
+    if (kind === 'crackle' || kind === 'strobe') {
+      for (let i = 0; i < 6; i++) {
+        playFilteredNoise({ x: x + normal(0, W * 0.025), duration: 0.030, gain: 0.015, frequency: rand(3200, 1600), type: 'bandpass', when: 0.18 + i * 0.055 });
+      }
+    }
+  }
+
+  function playCrackleSound(x) {
+    if (!audioEnabled || !audioCtx || Math.random() < 0.45) return;
+    playFilteredNoise({ x, duration: 0.022, gain: 0.010, frequency: rand(5200, 2200), type: 'bandpass' });
+  }
+
+  function clamp(n, a, b) {
+    return Math.max(a, Math.min(b, n));
+  }
+
+  function rand(a = 1, b = 0) {
+    return b + Math.random() * (a - b);
+  }
+
+  function choice(list) {
+    return list[(Math.random() * list.length) | 0];
+  }
+
+  function normal(mean = 0, dev = 1) {
+    let u = 0;
+    let v = 0;
+    while (u === 0) u = Math.random();
+    while (v === 0) v = Math.random();
+    return mean + Math.sqrt(-2 * Math.log(u)) * Math.cos(Math.PI * 2 * v) * dev;
+  }
+
+  function rgba(c, a) {
+    return `rgba(${c[0] | 0},${c[1] | 0},${c[2] | 0},${clamp(a, 0, 1)})`;
+  }
+
+  function mix(a, b, t) {
+    return [
+      a[0] + (b[0] - a[0]) * t,
+      a[1] + (b[1] - a[1]) * t,
+      a[2] + (b[2] - a[2]) * t,
+    ];
+  }
+
+  function scaleColor(c, s) {
+    return [
+      clamp(c[0] * s, 0, 255),
+      clamp(c[1] * s, 0, 255),
+      clamp(c[2] * s, 0, 255),
+    ];
+  }
+
+  function jitterColor(c, amount = 10) {
+    return [
+      clamp(c[0] + normal(0, amount), 0, 255),
+      clamp(c[1] + normal(0, amount), 0, 255),
+      clamp(c[2] + normal(0, amount), 0, 255),
+    ];
+  }
+
+  function sphereVelocity(speed, verticalScale = 0.94) {
+    const theta = rand(Math.PI * 2);
+    const z = rand(1, -1);
+    const r = Math.sqrt(Math.max(0, 1 - z * z));
+    return {
+      vx: Math.cos(theta) * r * speed,
+      vy: Math.sin(theta) * r * speed * verticalScale,
+      depth: 0.74 + (z + 1) * 0.25,
+    };
+  }
+
+  function addAtmosphericDrift(vx, vy, amount = 0.035) {
+    return {
+      vx: vx + normal(0, amount * SCALE) + wind * 1.8,
+      vy: vy + normal(0, amount * 0.55 * SCALE),
+    };
+  }
+
+  function seeded(seed) {
+    let t = seed >>> 0;
+    return () => {
+      t += 0x6D2B79F5;
+      let r = Math.imul(t ^ (t >>> 15), 1 | t);
+      r ^= r + Math.imul(r ^ (r >>> 7), 61 | r);
+      return ((r ^ (r >>> 14)) >>> 0) / 4294967296;
+    };
+  }
+
+  function makeSensorGrain() {
+    grainCanvas.width = 180;
+    grainCanvas.height = 180;
+    const image = grainCtx.createImageData(grainCanvas.width, grainCanvas.height);
+    const rnd = seeded(31991 + W * 3 + H * 5);
+    for (let i = 0; i < image.data.length; i += 4) {
+      const v = 90 + rnd() * 95;
+      image.data[i] = v;
+      image.data[i + 1] = v;
+      image.data[i + 2] = v + rnd() * 16;
+      image.data[i + 3] = rnd() < 0.46 ? 18 : 0;
+    }
+    grainCtx.putImageData(image, 0, 0);
+  }
+
+  function resize() {
+    const oldW = W;
+    const oldH = H;
+    const cssW = Math.max(1, window.innerWidth);
+    const cssH = Math.max(1, window.innerHeight);
+    const narrowCss = (cssW / cssH) < 0.95;
+    DPR = Math.min(window.devicePixelRatio || 1, narrowCss ? 1.55 : 1.85);
+    W = Math.max(1, Math.floor(cssW * DPR));
+    H = Math.max(1, Math.floor(cssH * DPR));
+    SCALE = clamp(Math.sqrt((W * H) / (1280 * 820)), 0.46, 1.25);
+    narrowView = narrowCss;
+    HORIZON = Math.floor(H * (narrowView ? 0.765 : 0.705));
+    WATER = H - HORIZON;
+
+    for (const c of [canvas, exposure, smokeCanvas]) {
+      c.width = W;
+      c.height = H;
+    }
+    bloomCanvas.width = Math.max(1, Math.floor(W * 0.44));
+    bloomCanvas.height = Math.max(1, Math.floor(H * 0.44));
+    makeSensorGrain();
+
+    makeEnvironment();
+
+    if (hasResizedOnce && (Math.abs(oldW - W) > 2 || Math.abs(oldH - H) > 2)) {
+      resetOpeningCue();
+    }
+    hasResizedOnce = true;
+  }
+
+  function resetOpeningCue() {
+    clearTransientEffects();
+    nextLaunch = elapsed * 60 + 18;
+    if (narrowView) {
+      burstAt(W * 0.49, HORIZON - 224 * SCALE, 'peony', palette[4], 0.76);
+      scheduleBurst(210, W * 0.54, HORIZON - 210 * SCALE, 'chrys', palette[2], 0.70);
+      scheduleBurst(420, W * 0.43, HORIZON - 190 * SCALE, 'ring', palette[1], 0.66);
+      launchShell(W * 0.47, 'peony', palette[4], 'high', 0.78);
+      scheduleLaunch(48, W * 0.54, 'chrys', palette[2], 'mid', 0.70);
+      scheduleLaunch(108, W * 0.43, 'ring', palette[1], 'mid', 0.70);
+      scheduleLaunch(210, W * 0.50, 'brocade', gold, 'high', 0.78);
+      scheduleLaunch(330, W * 0.39, 'peony', palette[0], 'mid', 0.68);
+      scheduleLaunch(450, W * 0.61, 'strobe', whiteHot, 'mid', 0.66);
+    } else {
+      burstAt(W * 0.36, HORIZON - 232 * SCALE, 'willow', gold, 0.86);
+      scheduleBurst(210, W * 0.66, HORIZON - 210 * SCALE, 'peony', palette[2], 0.78);
+      scheduleBurst(420, W * 0.52, HORIZON - 188 * SCALE, 'crossette', palette[1], 0.74);
+      scheduleLaunch(14, W * 0.42, 'willow', gold, 'high', 0.96);
+      scheduleLaunch(69, W * 0.68, 'peony', palette[2], 'mid', 0.82);
+      scheduleLaunch(126, W * 0.54, 'crossette', palette[1], 'mid', 0.86);
+    }
+  }
+
+  function makeEnvironment() {
+    const rnd = seeded(20260601 + W * 13 + H * 7);
+    farShore = [];
+    skyline = [];
+    shoreLights = [];
+    boats = [];
+    faintStars = [];
+
+    let cityX = -24 * SCALE;
+    while (cityX < W + 24 * SCALE) {
+      const bw = (10 + rnd() * 34) * SCALE * (narrowView ? 0.82 : 1.0);
+      let bh = (14 + Math.pow(rnd(), 1.35) * 70) * SCALE * (narrowView ? 0.70 : 1.0);
+      if (rnd() < 0.10) bh *= 1.55;
+      const baseOffset = (2 + rnd() * 7) * SCALE;
+      const roof = rnd();
+      const windows = [];
+      const cols = Math.max(1, Math.floor(bw / Math.max(4.8 * SCALE, 3)));
+      const rows = Math.max(1, Math.floor(bh / Math.max(6.5 * SCALE, 4)));
+      for (let row = 1; row < rows; row++) {
+        for (let col = 0; col < cols; col++) {
+          const occupied = rnd() < (row < rows * 0.18 ? 0.045 : 0.105);
+          if (!occupied) continue;
+          windows.push({
+            x: (col + 0.42 + (rnd() - 0.5) * 0.14) / cols,
+            y: row / rows,
+            a: 0.09 + rnd() * 0.20,
+            warm: rnd(),
+            p: rnd() * Math.PI * 2,
+          });
+        }
+      }
+      skyline.push({
+        x: cityX,
+        w: bw,
+        h: bh,
+        baseOffset,
+        roof,
+        antenna: rnd() < 0.15,
+        beacon: rnd() < 0.11,
+        shade: 0.56 + rnd() * 0.30,
+        windows,
+      });
+      cityX += bw + (2 + rnd() * 8) * SCALE;
+    }
+
+    let x = -28 * SCALE;
+    let y = HORIZON - 7 * SCALE;
+    while (x < W + 28 * SCALE) {
+      y += (rnd() - 0.5) * 7.5 * SCALE;
+      if (rnd() < 0.10) y -= (4 + rnd() * 15) * SCALE;
+      if (rnd() < 0.12) y += (3 + rnd() * 8) * SCALE;
+      y = clamp(y, HORIZON - 30 * SCALE, HORIZON + 5 * SCALE);
+      farShore.push({ x, y });
+      x += (18 + rnd() * 44) * SCALE;
+    }
+
+    x = W * 0.02;
+    while (x < W * 0.98) {
+      if (rnd() < 0.32) {
+        shoreLights.push({
+          x: x + (rnd() - 0.5) * 15 * SCALE,
+          y: HORIZON - (1 + rnd() * 6) * SCALE,
+          a: 0.14 + rnd() * 0.28,
+          r: (0.55 + rnd() * 1.0) * SCALE,
+        });
+      }
+      x += (24 + rnd() * 72) * SCALE;
+    }
+
+    const boatCount = narrowView ? 2 : 4;
+    for (let i = 0; i < boatCount; i++) {
+      boats.push({
+        x: rnd() * W,
+        y: HORIZON + WATER * (0.22 + rnd() * 0.56),
+        w: (22 + rnd() * 42) * SCALE,
+        h: (4 + rnd() * 8) * SCALE,
+        phase: rnd() * Math.PI * 2,
+        speed: (rnd() - 0.5) * 0.012 * SCALE,
+        light: false,
+      });
+    }
+
+    for (let i = 0; i < 110; i++) {
+      faintStars.push({
+        x: rnd() * W,
+        y: rnd() * HORIZON * 0.72,
+        a: 0.12 + rnd() * 0.36,
+        r: Math.max(0.45, rnd() * 1.25 * SCALE),
+        p: rnd() * Math.PI * 2,
+      });
+    }
+  }
+
+  class Flash {
+    constructor(x, y, color, strength = 1, radius = 120 * SCALE) {
+      this.x = x;
+      this.y = y;
+      this.color = color;
+      this.life = 16 + strength * 14;
+      this.maxLife = this.life;
+      this.radius = radius;
+      this.strength = strength;
+    }
+
+    update(step) {
+      this.life -= step;
+    }
+
+    get ratio() {
+      return Math.max(0, this.life / this.maxLife);
+    }
+
+    drawAtmosphere(target) {
+      const t = this.ratio;
+      if (t <= 0) return;
+      const r = this.radius * (1.0 + (1 - t) * 0.55);
+      const g = target.createRadialGradient(this.x, this.y, 0, this.x, this.y, r);
+      const a = 0.086 * this.strength * t * t;
+      g.addColorStop(0, rgba(mix(whiteHot, this.color, 0.35), a * 0.58));
+      g.addColorStop(0.16, rgba(this.color, a * 0.34));
+      g.addColorStop(0.52, rgba(this.color, a * 0.07));
+      g.addColorStop(1, rgba(this.color, 0));
+      target.save();
+      target.globalCompositeOperation = 'screen';
+      target.fillStyle = g;
+      target.beginPath();
+      target.arc(this.x, this.y, r, 0, Math.PI * 2);
+      target.fill();
+      target.restore();
+    }
+  }
+
+  class Smoke {
+    constructor(x, y, size = rand(10, 4) * SCALE, density = 1) {
+      this.x = x;
+      this.y = y;
+      this.vx = normal(0, 0.08 * SCALE);
+      this.vy = rand(0.02, -0.10) * SCALE;
+      this.size = size;
+      this.life = rand(170, 68);
+      this.maxLife = this.life;
+      this.density = density;
+      this.phase = rand(Math.PI * 2);
+    }
+
+    update(step) {
+      this.phase += 0.011 * step;
+      this.vx += wind * 0.22 * step + normal(0, 0.0025 * SCALE);
+      this.vy -= 0.0025 * SCALE * step;
+      this.x += this.vx * step;
+      this.y += this.vy * step;
+      this.size += (0.035 + (1 - this.life / this.maxLife) * 0.035) * SCALE * step;
+      this.life -= step;
+    }
+
+    draw(target) {
+      const t = Math.max(0, this.life / this.maxLife);
+      if (t <= 0) return;
+
+      let lit = [30, 31, 35];
+      for (const f of flashes) {
+        const dx = this.x - f.x;
+        const dy = this.y - f.y;
+        const reach = f.radius * 1.35;
+        const d = Math.sqrt(dx * dx + dy * dy);
+        if (d < reach) {
+          const amount = Math.pow(1 - d / reach, 2.2) * f.ratio * f.strength;
+          lit = [
+            lit[0] + f.color[0] * 0.18 * amount,
+            lit[1] + f.color[1] * 0.16 * amount,
+            lit[2] + f.color[2] * 0.13 * amount,
+          ];
+        }
+      }
+
+      const r = this.size * (0.82 + Math.sin(this.phase) * 0.04);
+      const a = 0.020 * t * this.density;
+      const g = target.createRadialGradient(this.x, this.y, r * 0.18, this.x, this.y, r);
+      g.addColorStop(0, rgba(lit, a * 1.4));
+      g.addColorStop(0.55, rgba(lit, a * 0.62));
+      g.addColorStop(1, rgba(lit, 0));
+      target.fillStyle = g;
+      target.beginPath();
+      target.arc(this.x, this.y, r, 0, Math.PI * 2);
+      target.fill();
+    }
+  }
+
+  class Reflection {
+    constructor(x, color, strength = 1, width = 90 * SCALE) {
+      this.x = x;
+      this.color = color;
+      this.life = 66 + strength * 28;
+      this.maxLife = this.life;
+      this.strength = strength;
+      this.width = width;
+      this.phase = rand(Math.PI * 2);
+      this.rows = Array.from({ length: 28 }, () => rand(1, 0.62));
+    }
+
+    update(step) {
+      this.phase += 0.12 * step;
+      this.life -= step;
+    }
+
+    draw(target) {
+      const t = Math.max(0, this.life / this.maxLife);
+      if (t <= 0) return;
+      target.save();
+      target.globalCompositeOperation = 'screen';
+      for (let i = 0; i < 24; i++) {
+        const y = HORIZON + (12 + i * 10.5) * SCALE;
+        if (y > H) break;
+        const row = i / 24;
+        const half = this.width * (0.12 + row * 0.58) * (0.65 + Math.sin(this.phase + i * 0.7) * 0.16);
+        const wave = Math.sin(this.phase * 1.7 + i * 0.63) * half * 0.22;
+        const shimmer = 0.70 + Math.sin(this.phase * 1.35 + i * 1.8) * 0.16 + this.rows[i] * 0.14;
+        const alpha = 0.12 * t * this.strength * (1 - row) * shimmer;
+        target.strokeStyle = rgba(scaleColor(this.color, 0.50 + t * 0.22), alpha);
+        target.lineWidth = Math.max(1, 1.05 * SCALE);
+        target.beginPath();
+        target.moveTo(this.x + wave - half, y);
+        target.lineTo(this.x + wave + half, y);
+        target.stroke();
+      }
+      target.restore();
+    }
+  }
+
+  class LaunchFlare {
+    constructor(x, color = gold) {
+      this.x = x;
+      this.y = HORIZON + rand(3, -4) * SCALE;
+      this.color = color;
+      this.life = rand(32, 22);
+      this.maxLife = this.life;
+      this.phase = rand(Math.PI * 2);
+      this.sparks = Array.from({ length: 18 }, () => ({
+        a: rand(-Math.PI * 0.92, -Math.PI * 0.08),
+        v: rand(2.2, 0.45) * SCALE,
+        p: rand(1, 0),
+      }));
+    }
+
+    update(step) {
+      this.phase += 0.22 * step;
+      this.life -= step;
+    }
+
+    draw(target) {
+      const t = Math.max(0, this.life / this.maxLife);
+      if (t <= 0) return;
+      target.save();
+      target.globalCompositeOperation = 'screen';
+      const width = (15 + Math.sin(this.phase) * 2) * SCALE * (0.58 + t * 0.36);
+      const height = 7 * SCALE * (0.72 + t);
+      const g = target.createRadialGradient(this.x, this.y, 0, this.x, this.y, width);
+      g.addColorStop(0, rgba(mix(whiteHot, this.color, 0.40), 0.18 * t));
+      g.addColorStop(0.28, rgba(this.color, 0.075 * t));
+      g.addColorStop(1, rgba(this.color, 0));
+      target.fillStyle = g;
+      target.beginPath();
+      target.ellipse(this.x, this.y, width, height, 0, 0, Math.PI * 2);
+      target.fill();
+
+      target.lineCap = 'round';
+      for (const spark of this.sparks) {
+        const age = 1 - t;
+        const sx = this.x + Math.cos(spark.a) * spark.v * age * 10 * spark.p;
+        const sy = this.y + Math.sin(spark.a) * spark.v * age * 8 * spark.p + age * age * 18 * SCALE;
+        target.strokeStyle = rgba(this.color, 0.13 * t * spark.p);
+        target.lineWidth = Math.max(0.45, 0.9 * SCALE);
+        target.beginPath();
+        target.moveTo(this.x, this.y);
+        target.lineTo(sx, sy);
+        target.stroke();
+      }
+
+      target.strokeStyle = rgba(scaleColor(this.color, 0.44), 0.09 * t);
+      target.lineWidth = Math.max(0.55, 0.8 * SCALE);
+      for (let i = 0; i < 9; i++) {
+        const y = HORIZON + (8 + i * 10) * SCALE;
+        if (y > H) break;
+        const spread = width * (0.16 + i * 0.07) * (0.82 + Math.sin(this.phase + i) * 0.15);
+        target.beginPath();
+        target.moveTo(this.x - spread, y);
+        target.lineTo(this.x + spread, y);
+        target.stroke();
+      }
+      target.restore();
+    }
+  }
+
+  class Particle {
+    constructor(x, y, vx, vy, color, kind = 'star', depth = 1) {
+      this.x = x;
+      this.y = y;
+      this.vx = vx;
+      this.vy = vy;
+      this.color = color;
+      this.kind = kind;
+      this.depth = depth;
+      this.history = [];
+      this.phase = rand(Math.PI * 2);
+      this.alive = true;
+
+      const burstKinds = kind === 'star' || kind === 'peony' || kind === 'chrys' || kind === 'willow'
+        || kind === 'kamuro' || kind === 'palm' || kind === 'strobe' || kind === 'comet' || kind === 'crossette';
+      if (burstKinds) {
+        const preTravel = rand(2.15, 0.72);
+        this.x += this.vx * preTravel;
+        this.y += this.vy * preTravel;
+      }
+
+      const profile = {
+        star: [0.0022, 96, 12, 1.15],
+        peony: [0.0020, 112, 12, 1.18],
+        chrys: [0.00155, 136, 15, 0.92],
+        willow: [0.00082, 242, 20, 0.70],
+        kamuro: [0.00070, 270, 22, 0.74],
+        palm: [0.00105, 204, 18, 0.90],
+        strobe: [0.0034, 160, 10, 1.08],
+        comet: [0.0010, 188, 24, 1.15],
+        crossette: [0.0031, 62, 9, 0.82],
+        rocket: [0.0100, 26, 7, 0.58],
+        crack: [0.0060, 18, 4, 0.78],
+        ember: [0.0048, 38, 5, 0.48],
+        mine: [0.0024, 116, 14, 1.05],
+      }[kind] || [0.0022, 100, 12, 1];
+
+      this.drag = profile[0];
+      this.life = profile[1] * rand(1.18, 0.82);
+      this.maxLife = this.life;
+      this.trail = profile[2];
+      this.radius = Math.max(0.65, profile[3] * SCALE * rand(1.22, 0.78) * (0.82 + depth * 0.18));
+      this.canSmoke = kind !== 'rocket' && kind !== 'crack' && kind !== 'ember';
+    }
+
+    get ratio() {
+      return Math.max(0, this.life / this.maxLife);
+    }
+
+    update(step) {
+      if (!this.alive) return;
+      this.history.push([this.x, this.y]);
+      while (this.history.length > this.trail) this.history.shift();
+
+      const speed = Math.hypot(this.vx, this.vy);
+      if (speed > 0.01) {
+        const drag = this.drag * speed * step;
+        this.vx -= this.vx * drag;
+        this.vy -= this.vy * drag;
+      }
+
+      this.vx += wind * this.drag * 45 * step + normal(0, 0.004 * SCALE);
+      this.vy += 0.022 * SCALE * step + normal(0, 0.0025 * SCALE);
+      this.x += this.vx * step;
+      this.y += this.vy * step;
+      this.life -= step;
+      this.phase += 0.11 * step;
+
+      const shedKinds = this.kind === 'willow' || this.kind === 'kamuro' || this.kind === 'palm' || this.kind === 'chrys';
+      if (shedKinds && this.ratio < 0.48 && this.ratio > 0.10 && Math.random() < 0.0018 * step * quality) {
+        const drift = addAtmosphericDrift(this.vx * 0.08, this.vy * 0.08, 0.06);
+        particles.push(new Particle(
+          this.x,
+          this.y,
+          drift.vx,
+          drift.vy + rand(0.22, -0.04) * SCALE,
+          mix([135, 31, 7], this.color, 0.28),
+          'ember',
+          this.depth,
+        ));
+      }
+
+      if (this.canSmoke && this.life > 28 && Math.random() < 0.00078 * step * quality) {
+        smokes.push(new Smoke(this.x, this.y, rand(8, 3) * SCALE, 0.72));
+      }
+
+      if (this.life <= 0 || this.y > H + 80 * SCALE || this.x < -90 * SCALE || this.x > W + 90 * SCALE) {
+        this.alive = false;
+      }
+    }
+
+    colorAt() {
+      const t = this.ratio;
+      let c = this.color;
+      if (this.kind === 'strobe') {
+        const blink = Math.max(0, Math.sin(this.phase * 4.2));
+        c = scaleColor(whiteHot, 0.15 + blink * 0.95);
+      } else if (t > 0.955) {
+        c = mix(this.color, whiteHot, (t - 0.955) / 0.045 * 0.58);
+      } else if (t < 0.16) {
+        c = mix([110, 26, 6], this.color, t / 0.16);
+      }
+      return scaleColor(c, (0.12 + Math.pow(t, 0.44) * 0.88) * (0.82 + this.depth * 0.17));
+    }
+
+    draw(target) {
+      const t = this.ratio;
+      if (t <= 0) return;
+      if (this.kind === 'strobe' && Math.sin(this.phase * 4.6) < -0.15) return;
+      if (t < 0.07 && Math.random() < 0.42) return;
+
+      const c = this.colorAt();
+      const luminance = (c[0] + c[1] + c[2]) / 3;
+      const minLuminance = (this.kind === 'willow' || this.kind === 'kamuro') ? 22 : 27;
+      if (luminance < minLuminance && this.kind !== 'crack' && this.kind !== 'ember') return;
+      if (t < 0.13 && this.kind !== 'crack' && this.kind !== 'ember' && Math.random() < 0.72) return;
+      if (this.y > HORIZON + 18 * SCALE && this.kind !== 'rocket' && this.kind !== 'ember' && this.kind !== 'crack') return;
+
+      target.save();
+      target.globalCompositeOperation = 'lighter';
+      target.lineCap = 'round';
+
+      if (this.history.length > 1) {
+        const stride = avgFrameMs > 34 ? 2 : 1;
+        for (let i = 1; i < this.history.length; i += stride) {
+          const f = i / this.history.length;
+          const p0 = this.history[i - 1];
+          const p1 = this.history[i];
+          const alpha = 0.23 * Math.pow(f, 2.2) * Math.pow(t, 0.44);
+          target.strokeStyle = rgba(scaleColor(c, 0.36 + f * 0.50), alpha);
+          target.lineWidth = Math.max(0.65 * SCALE, this.radius * (0.48 + f * 0.32));
+          target.beginPath();
+          target.moveTo(p0[0], p0[1]);
+          target.lineTo(p1[0], p1[1]);
+          target.stroke();
+        }
+      }
+
+      target.fillStyle = rgba(c, 0.78 * Math.pow(t, 0.45));
+      target.beginPath();
+      target.arc(this.x, this.y, Math.max(0.55 * SCALE, this.radius * (0.55 + t * 0.26)), 0, Math.PI * 2);
+      target.fill();
+
+      if (t > 0.985 || this.kind === 'crack') {
+        target.fillStyle = rgba(whiteHot, 0.82 * t);
+        target.beginPath();
+        target.arc(this.x, this.y, Math.max(0.42 * SCALE, this.radius * 0.38), 0, Math.PI * 2);
+        target.fill();
+      }
+      target.restore();
+    }
+  }
+
+  class Shell {
+    constructor(x, kind = null, color = null, height = 'mid', size = 1) {
+      this.x = x;
+      this.y = H + 36 * SCALE;
+      this.vx = normal(0, 0.13 * SCALE);
+      const liftBoost = narrowView ? 1.28 : 1.0;
+      this.vy = ({
+        low: rand(-3.30, -3.92),
+        mid: rand(-4.02, -4.78),
+        high: rand(-4.62, -5.28),
+      }[height] || rand(-4.02, -4.78)) * SCALE * liftBoost;
+      this.kind = kind || weightedKind();
+      this.color = color || choice(palette);
+      this.color2 = choice(palette);
+      this.size = size;
+      this.age = 0;
+      this.trail = [];
+      this.exploded = false;
+      this.stretchX = rand(1.08, 0.92);
+      this.stretchY = rand(1.04, 0.88);
+      this.shear = normal(0, 0.040);
+      this.breakJitter = rand(1.16, 0.88);
+    }
+
+    update(step) {
+      this.age += step;
+      if (!this.exploded) {
+        this.trail.push([this.x, this.y]);
+        while (this.trail.length > 28) this.trail.shift();
+
+        const speed = Math.hypot(this.vx, this.vy);
+        if (speed > 0.01) {
+          const drag = 0.00030 * speed * step;
+          this.vx -= this.vx * drag;
+          this.vy -= this.vy * drag;
+        }
+        this.vx += wind * 0.10 * step;
+        this.vy += 0.022 * SCALE * step;
+        this.x += this.vx * step;
+        this.y += this.vy * step;
+
+        if (Math.random() < 0.72 * step) {
+          particles.push(new Particle(
+            this.x + normal(0, 0.7 * SCALE),
+            this.y + normal(0, 0.7 * SCALE),
+            normal(0, 0.22 * SCALE),
+            rand(0.34, 1.36) * SCALE,
+            Math.random() < 0.25 ? whiteHot : gold,
+            'rocket',
+          ));
+        }
+        if (Math.random() < 0.13 * step * quality) smokes.push(new Smoke(this.x, this.y, rand(5, 2) * SCALE, 0.45));
+        if (this.vy >= -0.05 * SCALE && this.age > 38) this.explode();
+      }
+    }
+
+    explode() {
+      const broad = isBroadKind(this.kind) || this.kind === 'palm';
+      const edgeMargin = Math.min(W * (narrowView ? 0.46 : 0.38), W * (narrowView ? 0.18 : 0.11) + (broad ? 92 : 46) * SCALE * this.size);
+      const topMargin = H * (broad ? 0.18 : 0.13);
+      this.x = clamp(this.x, edgeMargin, W - edgeMargin);
+      this.y = clamp(this.y, topMargin, HORIZON - 48 * SCALE);
+      this.exploded = true;
+      flashes.push(new Flash(this.x, this.y, this.color, 0.80 * this.size, 120 * SCALE * this.size));
+      reflections.push(new Reflection(this.x, this.color, 0.72 * this.size, 95 * SCALE * this.size));
+      playBurstSound(this.x, this.size, this.kind);
+      for (let i = 0; i < 8 * this.size; i++) {
+        smokes.push(new Smoke(this.x + normal(0, 7 * SCALE), this.y + normal(0, 7 * SCALE), rand(14, 6) * SCALE, rand(1.1, 0.7)));
+      }
+
+      const k = this.kind;
+      if (k === 'peony') this.burstPeony();
+      else if (k === 'chrys') this.burstChrysanthemum();
+      else if (k === 'willow') this.burstWillow();
+      else if (k === 'kamuro') this.burstKamuro();
+      else if (k === 'ring') this.burstRing();
+      else if (k === 'palm') this.burstPalm();
+      else if (k === 'strobe') this.burstStrobe();
+      else if (k === 'crackle') this.burstCrackle();
+      else if (k === 'crossette') this.burstCrossette();
+      else this.burstBrocade();
+    }
+
+    burstVector(speed, verticalScale = 0.94) {
+      const s = sphereVelocity(speed * this.breakJitter, verticalScale);
+      const vx = s.vx * this.stretchX + s.vy * this.shear;
+      const vy = s.vy * this.stretchY + normal(0, 0.030 * SCALE);
+      return { vx, vy, depth: s.depth };
+    }
+
+    burstPeony() {
+      for (let i = 0; i < qualityCount(310 * this.size, 150); i++) {
+        const v = Math.abs(normal(4.78 * SCALE * this.size, 0.64 * SCALE));
+        const s = this.burstVector(v, 0.92);
+        particles.push(new Particle(this.x, this.y, s.vx, s.vy, jitterColor(Math.random() < 0.14 ? this.color2 : this.color, 7), 'peony', s.depth));
+      }
+    }
+
+    burstChrysanthemum() {
+      const arms = qualityCount(34 + ((Math.random() * 16) | 0), 24);
+      for (let a = 0; a < arms; a++) {
+        const angle = a / arms * Math.PI * 2 + normal(0, 0.008);
+        const beads = quality > 0.78 ? 8 : 6;
+        for (let i = 0; i < beads; i++) {
+          const speed = (1.40 + i * 0.70) * SCALE * this.size * rand(1.08, 0.94);
+          const depth = rand(1.18, 0.78);
+          const vx = Math.cos(angle + normal(0, 0.014)) * speed * depth;
+          const vy = Math.sin(angle + normal(0, 0.014)) * speed * depth * 0.90;
+          particles.push(new Particle(
+            this.x,
+            this.y,
+            vx * this.stretchX + vy * this.shear,
+            vy * this.stretchY,
+            this.color,
+            'chrys',
+            depth,
+          ));
+        }
+      }
+    }
+
+    burstWillow() {
+      for (let i = 0; i < qualityCount(340 * this.size, 155); i++) {
+        const v = Math.abs(normal(3.22 * SCALE * this.size, 0.74 * SCALE));
+        const s = this.burstVector(v, 0.84);
+        particles.push(new Particle(this.x, this.y, s.vx, s.vy, jitterColor([255, rand(230, 188), rand(108, 52)], 7), 'willow', s.depth));
+      }
+    }
+
+    burstKamuro() {
+      for (let i = 0; i < qualityCount(410 * this.size, 175); i++) {
+        const v = Math.abs(normal(3.34 * SCALE * this.size, 0.90 * SCALE));
+        const s = this.burstVector(v, 0.82);
+        particles.push(new Particle(this.x, this.y, s.vx, s.vy, jitterColor([255, rand(238, 196), rand(142, 86)], 6), 'kamuro', s.depth));
+      }
+    }
+
+    burstBrocade() {
+      for (let i = 0; i < qualityCount(250 * this.size, 120); i++) {
+        const v = Math.abs(normal(4.18 * SCALE * this.size, 0.72 * SCALE));
+        const s = this.burstVector(v, 0.90);
+        particles.push(new Particle(this.x, this.y, s.vx, s.vy, jitterColor(Math.random() < 0.70 ? gold : this.color, 8), 'chrys', s.depth));
+      }
+      for (let i = 0; i < qualityCount(76 * this.size, 38); i++) {
+        const s = this.burstVector(rand(3.4, 1.0) * SCALE);
+        particles.push(new Particle(this.x, this.y, s.vx, s.vy, this.color2, 'peony', s.depth));
+      }
+    }
+
+    burstRing() {
+      const count = qualityCount(230 * this.size, 108);
+      const tilt = rand(0.78, 0.50);
+      for (let i = 0; i < count; i++) {
+        const a = i / count * Math.PI * 2 + normal(0, 0.030);
+        const v = rand(5.42, 4.28) * SCALE * this.size;
+        const depth = rand(1.15, 0.84);
+        particles.push(new Particle(this.x, this.y, Math.cos(a) * v * depth, Math.sin(a) * v * tilt * depth, this.color, 'peony', depth));
+      }
+    }
+
+    burstPalm() {
+      const arms = 7 + (Math.random() * 5) | 0;
+      for (let a = 0; a < arms; a++) {
+        const base = -Math.PI / 2 + rand(0.82, -0.82);
+        for (let i = 0; i < 24; i++) {
+          const v = rand(6.45, 2.25) * SCALE * this.size;
+          const angle = base + normal(0, 0.08);
+          const vx = Math.cos(angle) * v;
+          const vy = Math.sin(angle) * v;
+          particles.push(new Particle(this.x, this.y, vx * this.stretchX + vy * this.shear, vy * this.stretchY, jitterColor([255, rand(232, 184), rand(126, 74)], 8), 'palm'));
+        }
+      }
+    }
+
+    burstStrobe() {
+      for (let i = 0; i < qualityCount(230 * this.size, 100); i++) {
+        const s = this.burstVector(Math.abs(normal(4.18 * SCALE * this.size, 1.00 * SCALE)), 0.90);
+        particles.push(new Particle(this.x, this.y, s.vx, s.vy, whiteHot, 'strobe', s.depth));
+      }
+    }
+
+    burstCrackle() {
+      this.burstBrocade();
+      for (let i = 0; i < qualityCount(110 * this.size, 48); i++) {
+        const s = this.burstVector(Math.abs(normal(3.26 * SCALE * this.size, 0.86 * SCALE)), 0.90);
+        crackleSeeds.push(new CrackleSeed(
+          this.x,
+          this.y,
+          s.vx,
+          s.vy,
+          rand(82, 27),
+          Math.random() < 0.36 ? whiteHot : gold,
+        ));
+      }
+    }
+
+    burstCrossette() {
+      const count = qualityCount(96 * this.size, 42);
+      for (let i = 0; i < count; i++) {
+        const s = this.burstVector(Math.abs(normal(3.52 * SCALE * this.size, 0.72 * SCALE)), 0.90);
+        crossetteSeeds.push(new CrossetteSeed(
+          this.x,
+          this.y,
+          s.vx,
+          s.vy,
+          rand(50, 20),
+          jitterColor(Math.random() < 0.35 ? this.color2 : this.color, 8),
+        ));
+      }
+      for (let i = 0; i < qualityCount(74 * this.size, 34); i++) {
+        const s = this.burstVector(Math.abs(normal(4.20 * SCALE * this.size, 0.52 * SCALE)), 0.92);
+        particles.push(new Particle(this.x, this.y, s.vx, s.vy, mix(this.color, whiteHot, 0.16), 'peony', s.depth));
+      }
+    }
+
+    draw(target) {
+      if (this.exploded || this.trail.length < 2) return;
+      target.save();
+      target.globalCompositeOperation = 'lighter';
+      target.lineCap = 'round';
+      for (let i = 1; i < this.trail.length; i++) {
+        const f = i / this.trail.length;
+        const p0 = this.trail[i - 1];
+        const p1 = this.trail[i];
+        target.strokeStyle = rgba(scaleColor(gold, 0.34 + f * 0.44), 0.12 * f);
+        target.lineWidth = Math.max(0.7 * SCALE, 1.0 * SCALE * f);
+        target.beginPath();
+        target.moveTo(p0[0], p0[1]);
+        target.lineTo(p1[0], p1[1]);
+        target.stroke();
+      }
+      target.fillStyle = rgba(whiteHot, 0.78);
+      target.beginPath();
+      target.arc(this.x, this.y, Math.max(0.9, 1.15 * SCALE), 0, Math.PI * 2);
+      target.fill();
+      target.restore();
+    }
+  }
+
+  class Mine {
+    constructor(x, color = choice(palette)) {
+      this.life = 92;
+      this.x = x;
+      this.y = HORIZON + 12 * SCALE;
+      flashes.push(new Flash(this.x, this.y, color, 0.46, 80 * SCALE));
+      reflections.push(new Reflection(this.x, color, 0.48, 68 * SCALE));
+      playBurstSound(this.x, 0.55, 'mine');
+      for (let i = 0; i < qualityCount(95, 42); i++) {
+        const angle = rand(-Math.PI * 0.12, -Math.PI * 0.88);
+        const v = rand(7.7, 2.9) * SCALE;
+        particles.push(new Particle(this.x, this.y, Math.cos(angle) * v, Math.sin(angle) * v, jitterColor(color, 8), 'mine'));
+      }
+      for (let i = 0; i < 7; i++) smokes.push(new Smoke(this.x + normal(0, 7 * SCALE), this.y, rand(16, 6) * SCALE, 0.8));
+    }
+
+    update(step) {
+      this.life -= step;
+    }
+  }
+
+  class CrackleSeed {
+    constructor(x, y, vx, vy, delay, color = whiteHot) {
+      this.x = x;
+      this.y = y;
+      this.vx = vx;
+      this.vy = vy;
+      this.delay = delay;
+      this.color = color;
+      this.history = [];
+      this.alive = true;
+      this.phase = rand(Math.PI * 2);
+    }
+
+    update(step) {
+      if (!this.alive) return;
+      this.history.push([this.x, this.y]);
+      while (this.history.length > 6) this.history.shift();
+
+      const speed = Math.hypot(this.vx, this.vy);
+      if (speed > 0.01) {
+        const drag = 0.0026 * speed * step;
+        this.vx -= this.vx * drag;
+        this.vy -= this.vy * drag;
+      }
+      this.vx += wind * 0.10 * step + normal(0, 0.002 * SCALE);
+      this.vy += 0.017 * SCALE * step;
+      this.x += this.vx * step;
+      this.y += this.vy * step;
+      this.delay -= step;
+      this.phase += 0.17 * step;
+
+      if (this.delay <= 0) this.explode();
+      if (this.y > H + 40 * SCALE || this.x < -60 * SCALE || this.x > W + 60 * SCALE) {
+        this.alive = false;
+      }
+    }
+
+    explode() {
+      if (!this.alive) return;
+      const count = 8 + (Math.random() * 9) | 0;
+      flashes.push(new Flash(this.x, this.y, this.color, 0.26, 34 * SCALE));
+      playCrackleSound(this.x);
+      for (let i = 0; i < count; i++) {
+        const a = rand(Math.PI * 2);
+        const v = rand(2.25, 0.42) * SCALE;
+        particles.push(new Particle(
+          this.x,
+          this.y,
+          Math.cos(a) * v + this.vx * 0.08,
+          Math.sin(a) * v + this.vy * 0.08,
+          Math.random() < 0.58 ? whiteHot : gold,
+          'crack',
+        ));
+      }
+      if (Math.random() < 0.30) smokes.push(new Smoke(this.x, this.y, rand(5, 2) * SCALE, 0.35));
+      this.alive = false;
+    }
+
+    draw(target) {
+      if (!this.alive || this.history.length < 2) return;
+      const twinkle = 0.25 + Math.max(0, Math.sin(this.phase * 3.4)) * 0.38;
+      target.save();
+      target.globalCompositeOperation = 'lighter';
+      target.lineCap = 'round';
+      for (let i = 1; i < this.history.length; i++) {
+        const f = i / this.history.length;
+        target.strokeStyle = rgba(scaleColor(this.color, 0.55), twinkle * f * 0.15);
+        target.lineWidth = Math.max(0.45, 0.70 * SCALE);
+        target.beginPath();
+        target.moveTo(this.history[i - 1][0], this.history[i - 1][1]);
+        target.lineTo(this.history[i][0], this.history[i][1]);
+        target.stroke();
+      }
+      target.restore();
+    }
+  }
+
+  class CrossetteSeed {
+    constructor(x, y, vx, vy, delay, color = gold) {
+      this.x = x;
+      this.y = y;
+      this.vx = vx;
+      this.vy = vy;
+      this.delay = delay;
+      this.color = color;
+      this.history = [];
+      this.alive = true;
+      this.phase = rand(Math.PI * 2);
+    }
+
+    update(step) {
+      if (!this.alive) return;
+      this.history.push([this.x, this.y]);
+      while (this.history.length > 8) this.history.shift();
+
+      const speed = Math.hypot(this.vx, this.vy);
+      if (speed > 0.01) {
+        const drag = 0.0021 * speed * step;
+        this.vx -= this.vx * drag;
+        this.vy -= this.vy * drag;
+      }
+      this.vx += wind * 0.09 * step + normal(0, 0.002 * SCALE);
+      this.vy += 0.018 * SCALE * step;
+      this.x += this.vx * step;
+      this.y += this.vy * step;
+      this.delay -= step;
+      this.phase += 0.12 * step;
+
+      if (this.delay <= 0) this.split();
+      if (this.y > HORIZON + 18 * SCALE || this.x < -80 * SCALE || this.x > W + 80 * SCALE) {
+        this.alive = false;
+      }
+    }
+
+    split() {
+      if (!this.alive) return;
+      const base = Math.atan2(this.vy, this.vx) + Math.PI * 0.25;
+      const strength = rand(2.35, 1.45) * SCALE;
+      flashes.push(new Flash(this.x, this.y, this.color, 0.18, 26 * SCALE));
+      playCrackleSound(this.x);
+      for (let i = 0; i < 4; i++) {
+        const a = base + i * Math.PI * 0.5 + normal(0, 0.045);
+        particles.push(new Particle(
+          this.x,
+          this.y,
+          Math.cos(a) * strength + this.vx * 0.08,
+          Math.sin(a) * strength + this.vy * 0.08,
+          Math.random() < 0.18 ? whiteHot : this.color,
+          'crossette',
+        ));
+      }
+      if (Math.random() < 0.42 * quality) smokes.push(new Smoke(this.x, this.y, rand(5, 2) * SCALE, 0.28));
+      this.alive = false;
+    }
+
+    draw(target) {
+      if (!this.alive || this.history.length < 2) return;
+      const twinkle = 0.22 + Math.max(0, Math.sin(this.phase * 2.6)) * 0.18;
+      target.save();
+      target.globalCompositeOperation = 'lighter';
+      target.lineCap = 'round';
+      for (let i = 1; i < this.history.length; i++) {
+        const f = i / this.history.length;
+        target.strokeStyle = rgba(scaleColor(this.color, 0.42 + f * 0.28), twinkle * f * 0.18);
+        target.lineWidth = Math.max(0.45, 0.76 * SCALE);
+        target.beginPath();
+        target.moveTo(this.history[i - 1][0], this.history[i - 1][1]);
+        target.lineTo(this.history[i][0], this.history[i][1]);
+        target.stroke();
+      }
+      target.restore();
+    }
+  }
+
+  function weightedKind() {
+    const list = [
+      ['peony', 22],
+      ['chrys', 17],
+      ['willow', 15],
+      ['kamuro', 11],
+      ['brocade', 12],
+      ['ring', 8],
+      ['palm', 7],
+      ['strobe', 4],
+      ['crackle', 4],
+      ['crossette', 5],
+    ];
+    let total = list.reduce((s, item) => s + item[1], 0);
+    let r = Math.random() * total;
+    for (const [name, w] of list) {
+      r -= w;
+      if (r <= 0) return name;
+    }
+    return 'peony';
+  }
+
+  function isBroadKind(kind) {
+    return kind === 'willow' || kind === 'kamuro' || kind === 'brocade' || kind === 'chrys';
+  }
+
+  function burstAt(x, y, kind = 'peony', color = choice(palette), size = 1) {
+    const shell = new Shell(x, kind, color, 'mid', size);
+    shell.x = x;
+    shell.y = clamp(y, 64 * SCALE, HORIZON - 48 * SCALE);
+    shell.explode();
+  }
+
+  function launchShell(x = null, kind = null, color = null, height = 'mid', size = 1) {
+    const launchX = x ?? autoX(kind, height, size);
+    const shellColor = color || choice(palette);
+    shells.push(new Shell(
+      launchX,
+      kind,
+      shellColor,
+      height,
+      size,
+    ));
+    launchFlares.push(new LaunchFlare(launchX, mix(shellColor, gold, 0.44)));
+    if (quality > 0.66) {
+      const plumeCount = Math.floor(rand(3, 1));
+      for (let i = 0; i < plumeCount; i++) {
+        smokes.push(new Smoke(launchX + normal(0, 5 * SCALE), HORIZON - rand(6, 0) * SCALE, rand(12, 5) * SCALE, 0.46));
+      }
+    }
+    playLaunchSound(launchX);
+  }
+
+  function autoX(kind = null, height = 'mid', size = 1) {
+    const broad = isBroadKind(kind);
+    const base = narrowView ? (height === 'high' ? 0.34 : 0.30) : (height === 'high' ? 0.22 : 0.17);
+    const margin = clamp(base + (broad ? 0.045 : 0) + (size > 1 ? 0.025 : 0), narrowView ? 0.28 : 0.16, narrowView ? 0.40 : 0.29);
+    return rand(W * (1 - margin), W * margin);
+  }
+
+  function launchMine(x = null, color = null) {
+    const launchX = x ?? rand(W * (narrowView ? 0.72 : 0.88), W * (narrowView ? 0.28 : 0.12));
+    const mineColor = color || choice(palette);
+    mines.push(new Mine(launchX, mineColor));
+    launchFlares.push(new LaunchFlare(launchX, mix(mineColor, amber, 0.34)));
+  }
+
+  function scheduleLaunch(delayFrames, x = null, kind = null, color = null, height = 'mid', size = 1) {
+    scheduledLaunches.push({ type: 'shell', delay: delayFrames, x, kind, color, height, size });
+  }
+
+  function scheduleBurst(delayFrames, x, y, kind = 'peony', color = choice(palette), size = 1) {
+    scheduledLaunches.push({ type: 'burst', delay: delayFrames, x, y, kind, color, size });
+  }
+
+  function updateScheduledLaunches(step) {
+    for (const item of scheduledLaunches) item.delay -= step;
+    for (let i = scheduledLaunches.length - 1; i >= 0; i--) {
+      const item = scheduledLaunches[i];
+      if (item.delay <= 0) {
+        if (item.type === 'burst') {
+          burstAt(item.x, item.y, item.kind, item.color, item.size);
+        } else {
+          launchShell(item.x, item.kind, item.color, item.height, item.size);
+        }
+        scheduledLaunches.splice(i, 1);
+      }
+    }
+  }
+
+  function clearTransientEffects() {
+    shells.length = 0;
+    particles.length = 0;
+    smokes.length = 0;
+    flashes.length = 0;
+    reflections.length = 0;
+    mines.length = 0;
+    crackleSeeds.length = 0;
+    crossetteSeeds.length = 0;
+    launchFlares.length = 0;
+    scheduledLaunches.length = 0;
+    exposureCtx.clearRect(0, 0, exposure.width, exposure.height);
+    smokeCtx.clearRect(0, 0, smokeCanvas.width, smokeCanvas.height);
+    bloomCtx.clearRect(0, 0, bloomCanvas.width, bloomCanvas.height);
+  }
+
+  function scaledLimit(base) {
+    const areaScale = clamp((W * H) / (1280 * 820), 0.48, 1.25);
+    return Math.floor(base * areaScale * clamp(quality, 0.62, 1.0));
+  }
+
+  function trimOldest(list, max) {
+    if (list.length > max) list.splice(0, list.length - max);
+  }
+
+  function qualityCount(base, min = 1) {
+    return Math.max(min, Math.floor(base * clamp(quality, 0.72, 1.0)));
+  }
+
+  function enforceBudgets() {
+    trimOldest(shells, 28);
+    trimOldest(mines, 14);
+    trimOldest(flashes, 48);
+    trimOldest(reflections, 64);
+    trimOldest(launchFlares, 36);
+    trimOldest(smokes, scaledLimit(340));
+    trimOldest(crackleSeeds, scaledLimit(420));
+    trimOldest(crossetteSeeds, scaledLimit(360));
+    trimOldest(particles, scaledLimit(7200));
+  }
+
+  function updateDirector(step) {
+    elapsed += step / 60;
+    if (elapsed * 60 < nextLaunch) return;
+    const cycle = elapsed % 86;
+
+    if (cycle < 16) {
+      launchShell(null, choice(narrowView ? ['peony', 'chrys', 'ring', 'crossette'] : ['peony', 'chrys', 'willow', 'crossette']), choice(palette), 'high', rand(narrowView ? 0.94 : 1.06, narrowView ? 0.76 : 0.90));
+      nextLaunch = elapsed * 60 + rand(narrowView ? 82 : 136, narrowView ? 46 : 88);
+    } else if (cycle < 35) {
+      const c = choice(palette);
+      launchShell(rand(W * (narrowView ? 0.50 : 0.46), W * (narrowView ? 0.34 : 0.24)), choice(['peony', 'ring', 'brocade', 'crossette']), c, 'mid', rand(narrowView ? 0.90 : 1.02, narrowView ? 0.72 : 0.86));
+      if (!narrowView || Math.random() < 0.65) {
+        launchShell(rand(W * (narrowView ? 0.66 : 0.76), W * (narrowView ? 0.52 : 0.54)), choice(narrowView ? ['peony', 'chrys', 'ring'] : ['peony', 'chrys', 'willow', 'crossette']), c, 'mid', rand(narrowView ? 0.90 : 1.02, narrowView ? 0.72 : 0.86));
+      }
+      if (Math.random() < 0.26) launchMine(null, mix(c, gold, 0.30));
+      nextLaunch = elapsed * 60 + rand(narrowView ? 84 : 126, narrowView ? 50 : 82);
+    } else if (cycle < 57) {
+      if (Math.random() < 0.50) {
+        for (let i = 0; i < 3; i++) launchMine(rand(W * (narrowView ? 0.72 : 0.86), W * (narrowView ? 0.28 : 0.14)), choice([gold, amber, choice(palette)]));
+      }
+      launchShell(null, choice(narrowView ? ['palm', 'strobe', 'peony', 'brocade'] : ['palm', 'kamuro', 'willow', 'strobe']), choice(palette), choice(['mid', 'high']), rand(narrowView ? 0.96 : 1.12, narrowView ? 0.74 : 0.90));
+      nextLaunch = elapsed * 60 + rand(narrowView ? 78 : 112, narrowView ? 46 : 72);
+    } else if (cycle < 74) {
+      const count = narrowView ? choice([2, 2, 3]) : choice([3, 3, 4]);
+      const c = [choice(palette), choice(palette), choice(palette)];
+      for (let i = 0; i < count; i++) {
+        launchShell(rand(W * (narrowView ? 0.68 : 0.80), W * (narrowView ? 0.32 : 0.20)), choice(['peony', 'brocade', 'ring', 'crackle', 'crossette']), c[i % c.length], choice(['mid', 'high']), rand(narrowView ? 0.92 : 1.04, narrowView ? 0.72 : 0.82));
+      }
+      nextLaunch = elapsed * 60 + rand(narrowView ? 66 : 82, narrowView ? 38 : 52);
+    } else {
+      const positions = narrowView ? [0.32, 0.42, 0.52, 0.62, 0.70] : [0.20, 0.30, 0.40, 0.50, 0.60, 0.70, 0.80];
+      for (const p of positions) {
+        const edge = p < 0.26 || p > 0.74;
+        const kinds = edge
+          ? ['peony', 'ring', 'strobe', 'crossette']
+          : (narrowView ? ['peony', 'brocade', 'crackle', 'strobe', 'crossette'] : ['peony', 'brocade', 'kamuro', 'crackle', 'strobe', 'crossette']);
+        const height = edge ? 'mid' : choice(['mid', 'high']);
+        const maxSize = edge ? (narrowView ? 0.82 : 0.88) : (narrowView ? 0.90 : 1.02);
+        if (Math.random() < (narrowView ? 0.58 : 0.72)) launchShell(W * p + normal(0, 6 * SCALE), choice(kinds), choice(palette), height, rand(maxSize, narrowView ? 0.70 : 0.76));
+        if (Math.random() < (narrowView ? 0.20 : 0.28)) launchMine(W * p, choice([gold, amber, choice(palette)]));
+      }
+      nextLaunch = elapsed * 60 + rand(narrowView ? 50 : 58, narrowView ? 30 : 34);
+    }
+  }
+
+  function drawDistantCity(target, now) {
+    if (!skyline.length) return;
+    target.save();
+    for (const b of skyline) {
+      const base = HORIZON + b.baseOffset;
+      const top = base - b.h;
+      const body = Math.floor(7 + b.shade * 9);
+      target.fillStyle = `rgba(${body},${body + 2},${body + 7},0.78)`;
+      target.fillRect(b.x, top, b.w, b.h + 10 * SCALE);
+
+      if (b.roof < 0.18) {
+        target.beginPath();
+        target.moveTo(b.x, top);
+        target.lineTo(b.x + b.w * 0.50, top - b.w * 0.16);
+        target.lineTo(b.x + b.w, top);
+        target.closePath();
+        target.fill();
+      } else if (b.roof < 0.35) {
+        target.fillRect(b.x + b.w * 0.18, top - 4 * SCALE, b.w * 0.64, 4 * SCALE);
+      }
+
+      if (b.antenna) {
+        target.strokeStyle = 'rgba(14,18,26,0.82)';
+        target.lineWidth = Math.max(0.65, 0.8 * SCALE);
+        target.beginPath();
+        target.moveTo(b.x + b.w * 0.50, top);
+        target.lineTo(b.x + b.w * 0.50, top - Math.min(18 * SCALE, b.h * 0.24));
+        target.stroke();
+      }
+    }
+
+    target.globalCompositeOperation = 'screen';
+    for (const b of skyline) {
+      const base = HORIZON + b.baseOffset;
+      const top = base - b.h;
+      for (const w of b.windows) {
+        const flicker = 0.78 + Math.sin(now * 0.00055 + w.p) * 0.12;
+        const tone = w.warm < 0.70 ? [255, 194, 116] : [160, 194, 235];
+        target.fillStyle = rgba(tone, w.a * flicker);
+        const wx = b.x + b.w * w.x;
+        const wy = top + b.h * w.y;
+        target.fillRect(wx, wy, Math.max(0.9, 1.15 * SCALE), Math.max(0.8, 1.0 * SCALE));
+      }
+      if (b.beacon) {
+        const blink = Math.max(0, Math.sin(now * 0.0038 + b.x * 0.01));
+        target.fillStyle = rgba([255, 48, 36], 0.13 + blink * 0.16);
+        target.beginPath();
+        target.arc(b.x + b.w * 0.55, top - 2 * SCALE, Math.max(0.7, 1.25 * SCALE), 0, Math.PI * 2);
+        target.fill();
+      }
+    }
+    target.restore();
+  }
+
+  function drawBoats(target, now) {
+    if (!boats.length) return;
+    target.save();
+    for (const b of boats) {
+      const drift = Math.sin(now * 0.00028 + b.phase) * b.w * 0.18 + now * b.speed;
+      const x = ((b.x + drift + b.w) % (W + b.w * 2)) - b.w;
+      const bob = Math.sin(now * 0.0013 + b.phase) * 1.0 * SCALE;
+      const y = b.y + bob;
+
+      target.globalCompositeOperation = 'source-over';
+      target.fillStyle = 'rgba(0,2,5,0.88)';
+      target.beginPath();
+      target.moveTo(x - b.w * 0.50, y);
+      target.lineTo(x + b.w * 0.47, y);
+      target.lineTo(x + b.w * 0.32, y + b.h);
+      target.lineTo(x - b.w * 0.34, y + b.h);
+      target.closePath();
+      target.fill();
+      target.fillRect(x - b.w * 0.12, y - b.h * 0.95, b.w * 0.26, b.h * 0.92);
+
+      if (!b.light) continue;
+      target.globalCompositeOperation = 'screen';
+      const lightX = x + b.w * 0.30;
+      const lightColor = [245, 188, 112];
+      const pulse = 0.55 + Math.sin(now * 0.002 + b.phase) * 0.22;
+      target.fillStyle = rgba(lightColor, 0.026 * pulse);
+      target.fillRect(lightX - 0.6 * SCALE, y - b.h * 0.88, Math.max(0.75, 1.2 * SCALE), Math.max(0.5, 0.8 * SCALE));
+      target.strokeStyle = rgba(lightColor, 0.008 * pulse);
+      target.lineWidth = Math.max(0.55, 0.8 * SCALE);
+      for (let i = 0; i < 3; i++) {
+        const ry = y + (7 + i * 7) * SCALE;
+        if (ry > H) break;
+        target.beginPath();
+        target.moveTo(lightX - (6 + i * 2) * SCALE, ry);
+        target.lineTo(lightX + (6 + i * 2) * SCALE, ry);
+        target.stroke();
+      }
+    }
+    target.restore();
+  }
+
+  function drawSensorTexture(target, now) {
+    if (avgFrameMs > 28 || !grainCanvas.width) return;
+    target.save();
+    target.globalCompositeOperation = 'source-over';
+    target.globalAlpha = 0.016;
+    const ox = -((now * 0.014) % grainCanvas.width);
+    const oy = -((now * 0.010) % grainCanvas.height);
+    const pattern = target.createPattern(grainCanvas, 'repeat');
+    if (pattern) {
+      target.translate(ox, oy);
+      target.fillStyle = pattern;
+      target.fillRect(-grainCanvas.width, -grainCanvas.height, W + grainCanvas.width * 2, H + grainCanvas.height * 2);
+    }
+    target.restore();
+  }
+
+  function drawBackground(target, now) {
+    const sky = target.createLinearGradient(0, 0, 0, H);
+    sky.addColorStop(0, '#020714');
+    sky.addColorStop(0.46, '#030812');
+    sky.addColorStop(0.70, '#05070d');
+    sky.addColorStop(1, '#020308');
+    target.fillStyle = sky;
+    target.fillRect(0, 0, W, H);
+
+    target.save();
+    for (const s of faintStars) {
+      const twinkle = 0.7 + Math.sin(now * 0.0007 + s.p) * 0.16;
+      target.fillStyle = rgba([195, 208, 226], s.a * twinkle);
+      target.beginPath();
+      target.arc(s.x, s.y, s.r, 0, Math.PI * 2);
+      target.fill();
+    }
+    target.restore();
+
+    const water = target.createLinearGradient(0, HORIZON, 0, H);
+    water.addColorStop(0, '#030812');
+    water.addColorStop(0.55, '#020610');
+    water.addColorStop(1, '#010308');
+    target.fillStyle = water;
+    target.fillRect(0, HORIZON, W, WATER);
+
+    const haze = target.createLinearGradient(0, HORIZON - 70 * SCALE, 0, HORIZON + 40 * SCALE);
+    haze.addColorStop(0, 'rgba(34,39,58,0)');
+    haze.addColorStop(0.62, 'rgba(42,43,56,0.14)');
+    haze.addColorStop(1, 'rgba(17,20,29,0)');
+    target.fillStyle = haze;
+    target.fillRect(0, HORIZON - 80 * SCALE, W, 130 * SCALE);
+
+    drawDistantCity(target, now);
+
+    target.fillStyle = 'rgba(0,2,5,0.86)';
+    target.beginPath();
+    target.moveTo(0, HORIZON + 16 * SCALE);
+    for (const point of farShore) {
+      target.lineTo(point.x, point.y);
+    }
+    target.lineTo(W, HORIZON + 42 * SCALE);
+    target.lineTo(0, HORIZON + 42 * SCALE);
+    target.closePath();
+    target.fill();
+
+    target.save();
+    target.globalCompositeOperation = 'screen';
+    for (const l of shoreLights) {
+      target.fillStyle = rgba([255, 202, 116], l.a);
+      target.beginPath();
+      target.arc(l.x, l.y, l.r, 0, Math.PI * 2);
+      target.fill();
+      target.fillStyle = rgba([255, 185, 92], l.a * 0.10);
+      target.fillRect(l.x - l.r * 5, HORIZON + 2 * SCALE, l.r * 10, 18 * SCALE);
+    }
+    target.restore();
+
+    target.save();
+    target.globalAlpha = 0.14;
+    target.strokeStyle = '#4f6380';
+    target.lineWidth = Math.max(0.6, 0.8 * SCALE);
+    for (let i = 0; i < 58; i++) {
+      const y = HORIZON + (8 + i * 8.3) * SCALE;
+      if (y > H) break;
+      const phase = now * 0.00025 + i * 0.77;
+      const x = (Math.sin(phase) * 0.5 + 0.5) * W;
+      const len = (28 + Math.sin(phase * 2.1) * 18 + i * 1.4) * SCALE;
+      target.beginPath();
+      target.moveTo(x - len, y);
+      target.lineTo(x + len, y);
+      target.stroke();
+    }
+    target.restore();
+  }
+
+  function drawWaterIllumination(target) {
+    if (!flashes.length) return;
+    target.save();
+    target.beginPath();
+    target.rect(0, HORIZON, W, H - HORIZON);
+    target.clip();
+    target.globalCompositeOperation = 'screen';
+    for (const f of flashes) {
+      const t = f.ratio * f.strength;
+      if (t <= 0 || f.y > HORIZON + 60 * SCALE) continue;
+      const width = f.radius * (0.14 + 0.16 * t);
+      const top = HORIZON + 7 * SCALE;
+      const bottom = Math.min(H, HORIZON + f.radius * 1.55);
+      const g = target.createLinearGradient(0, top, 0, bottom);
+      g.addColorStop(0, rgba(scaleColor(f.color, 0.34), 0.028 * t));
+      g.addColorStop(0.35, rgba(scaleColor(f.color, 0.26), 0.014 * t));
+      g.addColorStop(1, rgba(f.color, 0));
+      target.fillStyle = g;
+      target.fillRect(f.x - width, top, width * 2, bottom - top);
+    }
+    target.restore();
+  }
+
+  function drawWaterForeground(target, now) {
+    target.save();
+    target.globalCompositeOperation = 'source-over';
+    const water = target.createLinearGradient(0, HORIZON - 4 * SCALE, 0, H);
+    water.addColorStop(0, 'rgba(2,5,12,0.72)');
+    water.addColorStop(0.42, 'rgba(1,4,10,0.78)');
+    water.addColorStop(1, 'rgba(0,2,6,0.84)');
+    target.fillStyle = water;
+    target.fillRect(0, HORIZON - 2 * SCALE, W, H - HORIZON + 2 * SCALE);
+
+    target.fillStyle = 'rgba(0,2,5,0.82)';
+    target.beginPath();
+    target.moveTo(0, HORIZON + 13 * SCALE);
+    for (const point of farShore) target.lineTo(point.x, point.y + 1.5 * SCALE);
+    target.lineTo(W, HORIZON + 38 * SCALE);
+    target.lineTo(0, HORIZON + 38 * SCALE);
+    target.closePath();
+    target.fill();
+
+    target.globalCompositeOperation = 'screen';
+    for (const l of shoreLights) {
+      target.fillStyle = rgba([255, 202, 116], l.a * 0.70);
+      target.beginPath();
+      target.arc(l.x, l.y, l.r, 0, Math.PI * 2);
+      target.fill();
+      target.fillStyle = rgba([255, 185, 92], l.a * 0.07);
+      target.fillRect(l.x - l.r * 4, HORIZON + 2 * SCALE, l.r * 8, 14 * SCALE);
+    }
+
+    target.globalCompositeOperation = 'source-over';
+    target.globalAlpha = 0.12;
+    target.strokeStyle = '#42536d';
+    target.lineWidth = Math.max(0.55, 0.75 * SCALE);
+    for (let i = 0; i < 46; i++) {
+      const y = HORIZON + (10 + i * 8.9) * SCALE;
+      if (y > H) break;
+      const phase = now * 0.00023 + i * 0.71;
+      const x = (Math.sin(phase) * 0.5 + 0.5) * W;
+      const len = (24 + Math.sin(phase * 2.0) * 12 + i * 1.25) * SCALE;
+      target.beginPath();
+      target.moveTo(x - len, y);
+      target.lineTo(x + len, y);
+      target.stroke();
+    }
+    target.restore();
+  }
+
+  function drawCameraVignette(target) {
+    const g = target.createRadialGradient(W * 0.50, H * 0.43, Math.min(W, H) * 0.18, W * 0.50, H * 0.45, Math.max(W, H) * 0.72);
+    g.addColorStop(0, 'rgba(0,0,0,0)');
+    g.addColorStop(0.68, 'rgba(0,0,0,0.07)');
+    g.addColorStop(1, 'rgba(0,0,0,0.38)');
+    target.fillStyle = g;
+    target.fillRect(0, 0, W, H);
+  }
+
+  function compact(list) {
+    for (let i = list.length - 1; i >= 0; i--) {
+      const item = list[i];
+      const expiredLife = typeof item.life === 'number' && item.life <= 0;
+      const spentShell = item instanceof Shell && item.exploded === true;
+      if (item.alive === false || expiredLife || spentShell) list.splice(i, 1);
+    }
+  }
+
+  function frame(now) {
+    if (document.hidden) {
+      frame.last = now;
+      requestAnimationFrame(frame);
+      return;
+    }
+
+    const frameMs = now - (frame.last || now);
+    avgFrameMs = avgFrameMs * 0.94 + frameMs * 0.06;
+    quality += ((avgFrameMs > 24 ? 0.68 : avgFrameMs > 19 ? 0.82 : 1.0) - quality) * 0.025;
+    quality = clamp(quality, 0.62, 1.0);
+
+    const maxStep = avgFrameMs > 45 ? 4.8 : 2.4;
+    const step = clamp(frameMs / 16.6667, 0.35, maxStep);
+    frame.last = now;
+
+    wind += (windTarget - wind) * 0.006 * step;
+    if (Math.random() < 0.002 * step) windTarget = normal(0.004, 0.010);
+
+    updateDirector(step);
+    updateScheduledLaunches(step);
+    enforceBudgets();
+
+    drawBackground(ctx, now);
+
+    smokeCtx.clearRect(0, 0, W, H);
+    smokeCtx.globalCompositeOperation = 'source-over';
+    for (const s of smokes) {
+      s.update(step);
+      s.draw(smokeCtx);
+    }
+    compact(smokes);
+
+    for (const m of mines) m.update(step);
+    compact(mines);
+
+    for (const l of launchFlares) l.update(step);
+    compact(launchFlares);
+
+    for (const s of shells) s.update(step);
+    compact(shells);
+
+    exposureCtx.save();
+    exposureCtx.globalCompositeOperation = 'destination-out';
+    const baseFade = 0.058 + 0.026 * clamp(particles.length / Math.max(1, scaledLimit(7200)), 0, 1);
+    const exposureStep = clamp(step, 1, 2.35);
+    const fade = clamp(1 - Math.pow(1 - baseFade, exposureStep), 0.035, 0.22);
+    exposureCtx.fillStyle = `rgba(0,0,0,${fade})`;
+    exposureCtx.fillRect(0, 0, W, H);
+    exposureCtx.restore();
+
+    exposureCtx.globalCompositeOperation = 'lighter';
+    for (const p of particles) {
+      p.update(step);
+      p.draw(exposureCtx);
+    }
+    compact(particles);
+
+    for (const seed of crackleSeeds) {
+      seed.update(step);
+      seed.draw(exposureCtx);
+    }
+    compact(crackleSeeds);
+
+    for (const seed of crossetteSeeds) {
+      seed.update(step);
+      seed.draw(exposureCtx);
+    }
+    compact(crossetteSeeds);
+
+    for (const s of shells) s.draw(exposureCtx);
+
+    for (const f of flashes) {
+      f.update(step);
+      f.drawAtmosphere(ctx);
+    }
+    compact(flashes);
+
+    ctx.drawImage(smokeCanvas, 0, 0);
+
+    ctx.save();
+    ctx.globalCompositeOperation = 'lighter';
+    bloomCtx.clearRect(0, 0, bloomCanvas.width, bloomCanvas.height);
+    bloomCtx.globalCompositeOperation = 'source-over';
+    bloomCtx.drawImage(exposure, 0, 0, bloomCanvas.width, bloomCanvas.height);
+
+    ctx.globalAlpha = 0.38;
+    ctx.filter = `blur(${Math.max(5, 11 * SCALE)}px) saturate(1.08)`;
+    ctx.drawImage(bloomCanvas, 0, 0, W, H);
+    ctx.globalAlpha = 0.56;
+    ctx.filter = `blur(${Math.max(2, 3.4 * SCALE)}px) saturate(1.12)`;
+    ctx.drawImage(exposure, 0, 0);
+    ctx.globalAlpha = 0.90;
+    ctx.filter = 'none';
+    ctx.drawImage(exposure, 0, 0);
+    ctx.restore();
+
+    ctx.save();
+    ctx.globalCompositeOperation = 'source-over';
+    ctx.globalAlpha = 0.12;
+    ctx.drawImage(smokeCanvas, 0, 0);
+    ctx.restore();
+
+    drawWaterForeground(ctx, now);
+    drawWaterIllumination(ctx);
+
+    for (const l of launchFlares) l.draw(ctx);
+
+    for (const r of reflections) {
+      r.update(step);
+      r.draw(ctx);
+    }
+    compact(reflections);
+
+    drawBoats(ctx, now);
+
+    ctx.save();
+    const veil = ctx.createLinearGradient(0, HORIZON - 20 * SCALE, 0, H);
+    veil.addColorStop(0, 'rgba(0,0,0,0)');
+    veil.addColorStop(0.50, 'rgba(0,0,0,0.06)');
+    veil.addColorStop(1, 'rgba(0,0,0,0.22)');
+    ctx.fillStyle = veil;
+    ctx.fillRect(0, HORIZON - 40 * SCALE, W, H - HORIZON + 40 * SCALE);
+    ctx.restore();
+
+    drawCameraVignette(ctx);
+    drawSensorTexture(ctx, now);
+
+    window.__fireworkStats = {
+      particles: particles.length,
+      smokes: smokes.length,
+      flashes: flashes.length,
+      reflections: reflections.length,
+      crackleSeeds: crackleSeeds.length,
+      crossetteSeeds: crossetteSeeds.length,
+      launchFlares: launchFlares.length,
+      shells: shells.length,
+      mines: mines.length,
+      quality: +quality.toFixed(3),
+      avgFrameMs: +avgFrameMs.toFixed(2),
+    };
+
+    enforceBudgets();
+
+    requestAnimationFrame(frame);
+  }
+
+  window.addEventListener('resize', resize);
+  canvas.addEventListener('pointerdown', (event) => {
+    ensureAudio();
+    const rect = canvas.getBoundingClientRect();
+    const x = (event.clientX - rect.left) * DPR;
+    launchShell(x, choice(['peony', 'ring', 'chrys', 'willow', 'brocade', 'crossette']), choice(palette), 'mid', rand(1.10, 0.92));
+  });
+  window.addEventListener('keydown', (event) => {
+    if (event.key === ' ') {
+      ensureAudio();
+      event.preventDefault();
+      launchShell(null, choice(['peony', 'brocade', 'kamuro', 'crackle', 'crossette']), choice(palette), 'high', rand(1.12, 0.94));
+    }
+    if (event.key.toLowerCase() === 'm') {
+      ensureAudio();
+      event.preventDefault();
+      launchMine(null, choice([gold, amber, choice(palette)]));
+    }
+  });
+
+  resize();
+  resetOpeningCue();
+  requestAnimationFrame(frame);
+})();
+</script>
+</body>
+</html>
