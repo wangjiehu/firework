@@ -1,11 +1,13 @@
-# Local preview captures
+# Local preview captures and QA artifacts
+previews/
 *.png
 
-# Earlier local experiments
+# Local tools and earlier experiments
+tools/
+archive/
 *.py
 __pycache__/
 .antigravitycli/
-tools/
 
 # Editor and OS noise
 .DS_Store
