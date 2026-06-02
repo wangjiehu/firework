@@ -22,8 +22,8 @@ Open `index.html` in a browser.
 ├── index.html    # The complete fireworks show
 ├── README.md     # Project information
 ├── .nojekyll     # Keeps GitHub Pages simple
-└── .gitignore    # Keeps local previews and experiments out of the repo
+├── .gitignore    # Keeps local previews and experiments out of the repo
+└── .gitattributes
 ```
 
 The public GitHub Pages site intentionally keeps only the static page and project metadata. Local screenshots, verification tools, and earlier experiments are kept outside the published repo.
-
